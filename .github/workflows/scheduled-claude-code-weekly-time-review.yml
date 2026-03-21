@@ -1,0 +1,124 @@
+name: Scheduled - Weekly Time Review Summary
+
+on:
+  schedule:
+    # Run every Friday at 4 PM UTC (adjust to your timezone)
+    - cron: '0 16 * * 5'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  weekly-time-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Gather weekly activity
+        id: activity
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          WEEK_START=$(date -d "last monday" +%Y-%m-%dT00:00:00Z)
+          WEEK_END=$(date +%Y-%m-%dT23:59:59Z)
+
+          echo "week_start=$(date -d "last monday" +%Y-%m-%d)" >> $GITHUB_OUTPUT
+          echo "week_end=$(date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+          # PRs merged this week
+          MERGED_PRS=$(gh pr list --state merged --json number,title,mergedAt,author \
+            --jq "[.[] | select(.mergedAt >= \"$WEEK_START\")] | length")
+          echo "merged_prs=$MERGED_PRS" >> $GITHUB_OUTPUT
+
+          # Issues closed this week
+          CLOSED_ISSUES=$(gh issue list --state closed --json number,title,closedAt \
+            --jq "[.[] | select(.closedAt >= \"$WEEK_START\")] | length")
+          echo "closed_issues=$CLOSED_ISSUES" >> $GITHUB_OUTPUT
+
+          # Issues opened this week
+          OPENED_ISSUES=$(gh issue list --state all --json number,title,createdAt \
+            --jq "[.[] | select(.createdAt >= \"$WEEK_START\")] | length")
+          echo "opened_issues=$OPENED_ISSUES" >> $GITHUB_OUTPUT
+
+          # Open PRs needing attention
+          OPEN_PRS=$(gh pr list --state open --json number,title,updatedAt | jq length)
+          echo "open_prs=$OPEN_PRS" >> $GITHUB_OUTPUT
+
+          # Commits this week
+          COMMITS=$(git log --since="$WEEK_START" --oneline 2>/dev/null | wc -l)
+          echo "commits=$COMMITS" >> $GITHUB_OUTPUT
+
+      - name: Claude Weekly Time Review
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: claude-opus-4-5-20251101
+          timeout_minutes: 15
+          track_progress: true
+          prompt: |
+            # Weekly Time & Productivity Review
+
+            You are a personal time management assistant creating a weekly review summary.
+            This review covers the week of ${{ steps.activity.outputs.week_start }} to ${{ steps.activity.outputs.week_end }}.
+
+            ## This Week's Numbers
+            - Commits: ${{ steps.activity.outputs.commits }}
+            - PRs merged: ${{ steps.activity.outputs.merged_prs }}
+            - Issues closed: ${{ steps.activity.outputs.closed_issues }}
+            - Issues opened: ${{ steps.activity.outputs.opened_issues }}
+            - Open PRs needing attention: ${{ steps.activity.outputs.open_prs }}
+
+            ## Your Tasks
+
+            1. **Gather details**: Run these commands to get the full picture:
+               - `gh pr list --state merged --json number,title,mergedAt,author` for this week's merged work
+               - `gh issue list --state closed --json number,title,closedAt,labels` for resolved items
+               - `gh issue list --state open --json number,title,labels,assignees` for what's still on the plate
+               - `gh pr list --state open --json number,title,labels,updatedAt` for in-flight work
+
+            2. **Create a weekly review issue** with the following sections:
+
+               ### Accomplishments
+               - List merged PRs and closed issues as concrete wins
+
+               ### In Progress
+               - Open PRs and their status
+               - Issues being actively worked on
+
+               ### Backlog Check
+               - How many open issues remain
+               - Any that have been open too long (> 2 weeks)
+               - Priorities for next week
+
+               ### Productivity Insights
+               - Compare this week's output to the numbers (commits, PRs, issues)
+               - Note any patterns (e.g., lots of small fixes vs. big features)
+               - Suggest focus areas for next week
+
+               ### Next Week Planning
+               - Top 3 priorities based on open issues and PR status
+               - Suggest what to tackle first on Monday morning
+
+            3. **Create the issue**:
+               - Title: "Weekly Review — ${{ steps.activity.outputs.week_start }} to ${{ steps.activity.outputs.week_end }}"
+               - Label: `weekly-review`
+               - Keep it concise but actionable
+
+            ## Guidelines
+            - Be encouraging and constructive — this is a personal productivity tool
+            - Focus on actionable insights, not just metrics
+            - Keep the tone warm and motivating
+            - If it was a light week, don't be judgmental — suggest how to ramp up
+            - If it was a heavy week, acknowledge the effort and suggest rest
+          claude_args: |
+            --max-turns 15
+            --allowedTools "Read,Glob,Grep,Bash(gh:*),Bash(git:*)"

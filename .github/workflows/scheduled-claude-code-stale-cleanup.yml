@@ -1,0 +1,116 @@
+name: Scheduled - Stale Issue & PR Cleanup
+
+on:
+  schedule:
+    # Run every Monday at 9 AM UTC
+    - cron: '0 9 * * 1'
+  workflow_dispatch:
+    inputs:
+      days_stale:
+        description: 'Number of days with no activity to consider stale'
+        required: false
+        default: '30'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale-cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find stale issues and PRs
+        id: find-stale
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DAYS_STALE="${{ github.event.inputs.days_stale || '30' }}"
+          STALE_DATE=$(date -d "-${DAYS_STALE} days" +%Y-%m-%dT%H:%M:%SZ)
+
+          echo "Looking for items with no activity since: $STALE_DATE"
+
+          # Find stale issues (open, no activity since cutoff)
+          STALE_ISSUES=$(gh issue list --state open --json number,title,updatedAt \
+            --jq "[.[] | select(.updatedAt < \"$STALE_DATE\")] | length")
+
+          # Find stale PRs (open, no activity since cutoff)
+          STALE_PRS=$(gh pr list --state open --json number,title,updatedAt \
+            --jq "[.[] | select(.updatedAt < \"$STALE_DATE\")] | length")
+
+          TOTAL=$((STALE_ISSUES + STALE_PRS))
+
+          echo "stale_issues=$STALE_ISSUES" >> $GITHUB_OUTPUT
+          echo "stale_prs=$STALE_PRS" >> $GITHUB_OUTPUT
+          echo "stale_date=$STALE_DATE" >> $GITHUB_OUTPUT
+          echo "days_stale=$DAYS_STALE" >> $GITHUB_OUTPUT
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "has_stale=false" >> $GITHUB_OUTPUT
+            echo "No stale issues or PRs found"
+          else
+            echo "has_stale=true" >> $GITHUB_OUTPUT
+            echo "Found $STALE_ISSUES stale issues and $STALE_PRS stale PRs"
+          fi
+
+      - name: Claude Stale Cleanup
+        if: steps.find-stale.outputs.has_stale == 'true'
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: claude-opus-4-5-20251101
+          timeout_minutes: 30
+          track_progress: true
+          prompt: |
+            # Weekly Stale Issue & PR Cleanup
+
+            You are running a scheduled cleanup of stale issues and pull requests.
+            Items are considered stale if they have had no activity in the last ${{ steps.find-stale.outputs.days_stale }} days (since ${{ steps.find-stale.outputs.stale_date }}).
+
+            Found: ${{ steps.find-stale.outputs.stale_issues }} stale issues, ${{ steps.find-stale.outputs.stale_prs }} stale PRs.
+
+            ## Your Tasks
+
+            1. **List stale issues**: Run `gh issue list --state open --json number,title,updatedAt,labels,assignees` and identify stale ones.
+
+            2. **List stale PRs**: Run `gh pr list --state open --json number,title,updatedAt,labels,author` and identify stale ones.
+
+            3. **Triage each stale item**:
+               For each stale issue or PR, decide the appropriate action:
+
+               - **Label as stale**: Add a `stale` label and post a polite comment asking if the issue/PR is still relevant.
+               - **Close**: If the item is clearly outdated, superseded, or a duplicate, close it with a comment explaining why.
+               - **Skip**: If the item has a `pinned`, `keep-open`, or `in-progress` label, leave it alone.
+
+            4. **For stale PRs specifically**:
+               - Check if the PR has merge conflicts (use `gh pr view <number> --json mergeable`)
+               - If it has conflicts AND is stale, comment suggesting the author rebase or close
+               - If tests are failing AND it's stale, mention that in the comment
+
+            5. **Report summary**: After processing, output a summary of actions taken.
+
+            ## Guidelines
+            - Be POLITE in all comments — contributors may return
+            - NEVER close issues labeled `bug`, `security`, or `critical` without careful review
+            - When closing, always explain the reason clearly
+            - Do NOT close PRs from external contributors without labeling as stale first
+            - If unsure whether to close something, just label it as stale instead
+            - Use the `stale` label consistently for tracking
+          claude_args: |
+            --max-turns 30
+            --allowedTools "Read,Glob,Grep,Bash(gh:*),Bash(git:*)"
+
+      - name: Report no stale items
+        if: steps.find-stale.outputs.has_stale == 'false'
+        run: |
+          echo "No stale issues or PRs found."
+          echo "Nothing to clean up."
